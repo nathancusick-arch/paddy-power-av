@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 from datetime import date, datetime, time
@@ -306,7 +306,7 @@ def load_store_database(data: bytes) -> Dict[str, List[Dict[str, object]]]:
         for sheet_name in sheets:
             records.extend(store_records_from_sheet(workbook, sheet_name))
         keys = [shop_code_key(record["shop_no"]) for record in records]
-        duplicates = sorted({key for key in keys if keys.count(key) > 1})
+        duplicates = sorted(key for key, count in Counter(keys).items() if count > 1)
         if duplicates:
             raise ValueError(
                 f"The Store DB contains duplicate {country} shop code(s): {', '.join(duplicates)}."
@@ -387,7 +387,7 @@ def coerce_general_value(value: object) -> object:
 
 def mapped_rows(df: pd.DataFrame, mapping: "OrderedDict[str, Optional[str]]") -> List[List[object]]:
     rows: List[List[object]] = []
-    for _, record in df.iterrows():
+    for record in df.to_dict(orient="records"):
         row: List[object] = []
         for output_header, export_header in mapping.items():
             raw = record.get(export_header, "") if export_header else ""
@@ -408,6 +408,60 @@ def load_workbook_from_bytes(data: bytes, *, data_only: bool = False):
         read_only=False,
         keep_links=True,
     )
+
+
+def remove_invalid_defined_names(data: bytes) -> bytes:
+    """Remove defined names that Excel would repair after source sheets are removed.
+
+    The non-LIVE workbook intentionally contains only presentation sheets. Names
+    that still point at deleted calculation/input sheets, external workbook names,
+    or #REF! targets are invalid in that reduced workbook. Valid print titles,
+    filters, and names on retained sheets are preserved.
+    """
+    from xml.etree import ElementTree as ET
+
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    sheet_ref_pattern = re.compile(r"(?:(?:'((?:[^']|'')+)')|([^'!,\s]+))!")
+    source = io.BytesIO(data)
+    output = io.BytesIO()
+    with zipfile.ZipFile(source, "r") as input_archive:
+        root = ET.fromstring(input_archive.read("xl/workbook.xml"))
+        valid_sheets = {
+            node.attrib.get("name", "")
+            for node in root.findall(f".//{{{main_ns}}}sheet")
+        }
+        for container in list(root.findall(f"{{{main_ns}}}definedNames")):
+            for defined_name in list(container.findall(f"{{{main_ns}}}definedName")):
+                target = defined_name.text or ""
+                referenced_sheets = {
+                    (quoted or plain or "").replace("''", "'")
+                    for quoted, plain in sheet_ref_pattern.findall(target)
+                }
+                invalid = (
+                    "#REF!" in target.upper()
+                    or "[" in target
+                    or bool(referenced_sheets - valid_sheets)
+                )
+                local_sheet_id = defined_name.attrib.get("localSheetId")
+                if local_sheet_id is not None:
+                    try:
+                        invalid = invalid or int(local_sheet_id) >= len(valid_sheets)
+                    except ValueError:
+                        invalid = True
+                if invalid:
+                    container.remove(defined_name)
+            if not list(container):
+                root.remove(container)
+        workbook_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        with zipfile.ZipFile(output, "w") as output_archive:
+            for info in input_archive.infolist():
+                content = (
+                    workbook_xml
+                    if info.filename == "xl/workbook.xml"
+                    else input_archive.read(info.filename)
+                )
+                output_archive.writestr(info, content)
+    return output.getvalue()
 
 
 def workbook_to_bytes(
@@ -763,6 +817,17 @@ def parse_month_from_name(filename: str) -> Optional[date]:
         return None
 
 
+def report_month_from_workbook(workbook, filename: str) -> Optional[date]:
+    try:
+        value = workbook["Checks"]["B20"].value
+        parsed = parse_date_value(value)
+        if parsed:
+            return parsed.date().replace(day=1)
+    except Exception:
+        pass
+    return parse_month_from_name(filename)
+
+
 def cached_report_month(data: bytes, filename: str) -> Optional[date]:
     try:
         workbook = load_workbook_from_bytes(data, data_only=True)
@@ -1023,17 +1088,16 @@ def build_non_live_report(formula_live: bytes, recalculated_live: bytes) -> byte
             continue
         formula_sheet = formula_workbook[sheet_name]
         value_sheet = value_workbook[sheet_name]
-        for row in formula_sheet.iter_rows():
-            for cell in row:
-                if is_formula_cell(cell):
-                    cached_value = value_sheet[cell.coordinate].value
-                    if (
-                        sheet_name == "Operational Questions"
-                        and isinstance(cached_value, str)
-                        and cached_value.startswith("#")
-                    ):
-                        cached_value = None
-                    cell.value = cached_value
+        for cell in list(formula_sheet._cells.values()):
+            if is_formula_cell(cell):
+                cached_value = value_sheet[cell.coordinate].value
+                if (
+                    sheet_name == "Operational Questions"
+                    and isinstance(cached_value, str)
+                    and cached_value.startswith("#")
+                ):
+                    cached_value = None
+                cell.value = cached_value
 
     summary = formula_workbook["Summary Data"]
     visit_count = value_workbook["Summary Data"]["C12"].value
@@ -1060,7 +1124,9 @@ def build_non_live_report(formula_live: bytes, recalculated_live: bytes) -> byte
     formula_workbook.calculation.calcMode = "auto"
     formula_workbook.calculation.fullCalcOnLoad = False
     formula_workbook.calculation.forceFullCalc = False
-    return workbook_to_bytes(formula_workbook, drawing_source=formula_live)
+    return remove_invalid_defined_names(
+        workbook_to_bytes(formula_workbook, drawing_source=formula_live)
+    )
 
 
 def zip_outputs(outputs: Dict[str, bytes]) -> bytes:
@@ -1100,8 +1166,8 @@ def generate_reports(
     validate_live_workbook(uk_template, "UK")
     validate_live_workbook(roi_template, "ROI")
 
-    uk_previous_month = cached_report_month(uk_live_bytes, uk_live_name)
-    roi_previous_month = cached_report_month(roi_live_bytes, roi_live_name)
+    uk_previous_month = report_month_from_workbook(uk_template, uk_live_name)
+    roi_previous_month = report_month_from_workbook(roi_template, roi_live_name)
     expected_previous = report_month - relativedelta(months=1)
     if uk_previous_month and uk_previous_month != expected_previous:
         raise ValueError(
@@ -1155,11 +1221,21 @@ def generate_reports(
         roi_future = executor.submit(recalculate_xlsx, roi_unrecalculated, roi_live_name_out)
         uk_recalculated = uk_future.result()
         roi_recalculated = roi_future.result()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        uk_non_live_future = executor.submit(
+            build_non_live_report, uk_unrecalculated, uk_recalculated
+        )
+        roi_non_live_future = executor.submit(
+            build_non_live_report, roi_unrecalculated, roi_recalculated
+        )
+        uk_non_live = uk_non_live_future.result()
+        roi_non_live = roi_non_live_future.result()
+
     outputs = {
         uk_live_name_out: uk_unrecalculated,
-        uk_name_out: build_non_live_report(uk_unrecalculated, uk_recalculated),
+        uk_name_out: uk_non_live,
         roi_live_name_out: roi_unrecalculated,
-        roi_name_out: build_non_live_report(roi_unrecalculated, roi_recalculated),
+        roi_name_out: roi_non_live,
     }
     counts = {
         "UK": len(uk_df),
