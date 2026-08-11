@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import openpyxl
 import pandas as pd
@@ -53,6 +53,7 @@ VALUE_ONLY_SHEETS = (
     "Store Performance",
     "Performance by Day & Time",
     "District Performance",
+    "Operational Questions",
     "Performance Over Time",
 )
 
@@ -222,6 +223,98 @@ IE_MAPPING: "OrderedDict[str, Optional[str]]" = OrderedDict(
 )
 
 
+STORE_DB_SHEETS = {
+    "UK": ("GB Shop List",),
+    "ROI": ("NI Shop List", "Ire Shop List"),
+}
+
+
+def normalise_header(value: object) -> str:
+    return re.sub(r"\s+", " ", "" if value is None else str(value).strip()).casefold()
+
+
+def normalise_shop_code(value: object) -> object:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)) and float(value).is_integer():
+        return int(value)
+    text = str(value).strip()
+    if re.fullmatch(r"\d+", text):
+        return int(text)
+    return text
+
+
+def shop_code_key(value: object) -> str:
+    normalised = normalise_shop_code(value)
+    return "" if normalised is None else str(normalised).strip()
+
+
+def store_records_from_sheet(workbook, sheet_name: str) -> List[Dict[str, object]]:
+    if sheet_name not in workbook.sheetnames:
+        raise ValueError(f"The Store DB is missing the required '{sheet_name}' sheet.")
+    sheet = workbook[sheet_name]
+    headers = {
+        normalise_header(cell.value): cell.column
+        for cell in sheet[1]
+        if normalise_header(cell.value)
+    }
+    required = ("shop no.", "site internal id", "district", "shop name", "district manager")
+    missing = [header for header in required if header not in headers]
+    if missing:
+        raise ValueError(
+            f"The '{sheet_name}' sheet in the Store DB is missing column(s): {', '.join(missing)}."
+        )
+
+    records: List[Dict[str, object]] = []
+    for row in range(2, sheet.max_row + 1):
+        shop_no = normalise_shop_code(sheet.cell(row, headers["shop no."]).value)
+        if shop_no in (None, ""):
+            continue
+        district = str(sheet.cell(row, headers["district"]).value or "").strip()
+        shop_name = str(sheet.cell(row, headers["shop name"]).value or "").strip()
+        if not district or not shop_name:
+            raise ValueError(
+                f"The '{sheet_name}' sheet has a blank District or Shop Name for shop {shop_no}."
+            )
+        records.append(
+            {
+                "shop_no": shop_no,
+                "site_internal_id": str(
+                    sheet.cell(row, headers["site internal id"]).value or ""
+                ).strip(),
+                "district": district,
+                "shop_name": shop_name,
+                "district_manager": str(
+                    sheet.cell(row, headers["district manager"]).value or ""
+                ).strip(),
+            }
+        )
+    return records
+
+
+def load_store_database(data: bytes) -> Dict[str, List[Dict[str, object]]]:
+    try:
+        workbook = load_workbook_from_bytes(data, data_only=True)
+    except Exception as exc:
+        raise ValueError(f"The Paddy Power Store DB could not be opened: {exc}") from exc
+
+    result: Dict[str, List[Dict[str, object]]] = {}
+    for country, sheets in STORE_DB_SHEETS.items():
+        records: List[Dict[str, object]] = []
+        for sheet_name in sheets:
+            records.extend(store_records_from_sheet(workbook, sheet_name))
+        keys = [shop_code_key(record["shop_no"]) for record in records]
+        duplicates = sorted({key for key in keys if keys.count(key) > 1})
+        if duplicates:
+            raise ValueError(
+                f"The Store DB contains duplicate {country} shop code(s): {', '.join(duplicates)}."
+            )
+        result[country] = records
+    return result
+
+
 def classify_country(postcode: object) -> str:
     pc = "" if postcode is None else str(postcode).strip().upper()
     pc = re.sub(r"\s+", " ", pc)
@@ -317,18 +410,26 @@ def load_workbook_from_bytes(data: bytes, *, data_only: bool = False):
     )
 
 
-def workbook_to_bytes(workbook, drawing_source: Optional[bytes] = None) -> bytes:
+def workbook_to_bytes(
+    workbook,
+    drawing_source: Optional[bytes] = None,
+    external_link_source: Optional[bytes] = None,
+) -> bytes:
     buffer = io.BytesIO()
     workbook.save(buffer)
     data = buffer.getvalue()
     if drawing_source:
-        data = restore_drawing_parts(data, drawing_source)
+        data = restore_package_parts(data, drawing_source, ("xl/drawings/", "xl/media/"))
+    if external_link_source:
+        # openpyxl drops the alternate URL relationship used by externalLink2.xml,
+        # which makes Excel repair the workbook on open. These legacy dashboard
+        # links are unchanged, so retain their original, internally consistent XML.
+        data = restore_package_parts(data, external_link_source, ("xl/externalLinks/",))
     return normalise_drawing_relationships(data)
 
 
-def restore_drawing_parts(data: bytes, source_data: bytes) -> bytes:
-    """Restore untouched image/drawing XML that openpyxl otherwise rewrites."""
-    prefixes = ("xl/drawings/", "xl/media/")
+def restore_package_parts(data: bytes, source_data: bytes, prefixes: Sequence[str]) -> bytes:
+    """Restore package parts that must remain byte-for-byte compatible with the template."""
     output = io.BytesIO()
     with (
         zipfile.ZipFile(io.BytesIO(data), "r") as input_archive,
@@ -342,6 +443,287 @@ def restore_drawing_parts(data: bytes, source_data: bytes) -> bytes:
             if info.filename.startswith(prefixes):
                 output_archive.writestr(info, source_archive.read(info.filename))
     return output.getvalue()
+
+
+def region_records_from_workbook(workbook) -> List[Dict[str, object]]:
+    sheet = workbook["Regions"]
+    records: List[Dict[str, object]] = []
+    for row in range(2, sheet.max_row + 1):
+        shop_no = normalise_shop_code(sheet.cell(row, 1).value)
+        district = str(sheet.cell(row, 2).value or "").strip()
+        shop_name = str(sheet.cell(row, 3).value or "").strip()
+        if shop_no in (None, "") or not district or not shop_name:
+            continue
+        manager = str(sheet.cell(row, 4).value or "").strip()
+        if manager == district:
+            manager = ""
+        records.append(
+            {
+                "shop_no": shop_no,
+                "site_internal_id": "",
+                "district": district,
+                "shop_name": shop_name,
+                "district_manager": manager,
+            }
+        )
+    return records
+
+
+def active_shop_codes(records: Sequence[Sequence[object]], mapping) -> set[str]:
+    site_code_index = list(mapping.keys()).index("Extra Site 1")
+    return {
+        shop_code_key(record[site_code_index])
+        for record in records
+        if shop_code_key(record[site_code_index])
+    }
+
+
+def merged_store_records(
+    workbook,
+    store_db_records: Sequence[Dict[str, object]],
+    retained_records: Sequence[Sequence[object]],
+    required_records: Sequence[Sequence[object]],
+    mapping,
+) -> List[Dict[str, object]]:
+    """Use the Store DB for current shops and retain historical shops still in R12M/YTD."""
+    current_keys = {shop_code_key(record["shop_no"]) for record in store_db_records}
+    needed_legacy_keys = active_shop_codes(retained_records, mapping) - current_keys
+    old_records = region_records_from_workbook(workbook)
+    old_by_key = {shop_code_key(record["shop_no"]): record for record in old_records}
+    missing = sorted(
+        active_shop_codes(required_records, mapping) - current_keys - set(old_by_key)
+    )
+    if missing:
+        raise ValueError(
+            "The Store DB and previous LIVE report do not contain shop code(s) used by the report data: "
+            + ", ".join(missing)
+            + "."
+        )
+    legacy = [
+        record
+        for record in old_records
+        if shop_code_key(record["shop_no"]) in needed_legacy_keys
+    ]
+    return [dict(record) for record in store_db_records] + legacy
+
+
+def update_regions_sheet(workbook, records: Sequence[Dict[str, object]]) -> int:
+    sheet = workbook["Regions"]
+    last_existing = max(
+        (row for row in range(2, sheet.max_row + 1) if sheet.cell(row, 1).value not in (None, "")),
+        default=1,
+    )
+    last_target = 1 + len(records)
+    clear_last = max(last_existing, last_target)
+    for row in range(1, clear_last + 1):
+        for column in range(1, 6):
+            sheet.cell(row, column).value = None
+
+    headers = ("Shop No.", "District", "Shop Name", "District Manager")
+    for column, header in enumerate(headers, start=1):
+        sheet.cell(1, column).value = header
+    for target_row, record in enumerate(records, start=2):
+        if target_row > last_existing:
+            copy_row_style(sheet, 2, target_row, 5)
+        sheet.cell(target_row, 1).value = record["shop_no"]
+        sheet.cell(target_row, 2).value = record["district"]
+        sheet.cell(target_row, 3).value = record["shop_name"]
+        sheet.cell(target_row, 4).value = record["district_manager"]
+
+    sheet.auto_filter.ref = f"A1:D{last_target}"
+    return last_target
+
+
+def update_region_lookup_ranges(workbook, last_region_row: int) -> None:
+    pattern = re.compile(r"Regions!\$A\$1:\$B\$\d+", re.IGNORECASE)
+    replacement = f"Regions!$A$1:$B${last_region_row}"
+    for sheet_name in ("This Period", "YTD", "R12M"):
+        sheet = workbook[sheet_name]
+        for cell in sheet[4]:
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                cell.value = pattern.sub(replacement, cell.value)
+
+
+def make_abort_result_formulas_explicit(workbook) -> None:
+    """Ensure abort rows return ABORT instead of looking up an empty challenge key."""
+    for sheet_name in ("This Period", "YTD", "R12M"):
+        sheet = workbook[sheet_name]
+        for cell in sheet[4]:
+            header = sheet.cell(3, cell.column).value
+            formula = cell.value
+            if (
+                header in ("Challenge", "Basic", "PP Result")
+                and isinstance(formula, str)
+                and formula.startswith("=VLOOKUP(")
+                and "Input!$Q$" in formula
+            ):
+                cell.value = f'=IF(UPPER($S4)="ABORT","ABORT",{formula[1:]})'
+
+
+def snapshot_row(sheet, row: int, max_column: int) -> Dict[str, Any]:
+    return {
+        "source_row": row,
+        "values": [sheet.cell(row, column).value for column in range(1, max_column + 1)],
+        "styles": [copy(sheet.cell(row, column)._style) for column in range(1, max_column + 1)],
+        "height": sheet.row_dimensions[row].height,
+        "hidden": sheet.row_dimensions[row].hidden,
+    }
+
+
+def restore_snapshot_row(
+    sheet,
+    target_row: int,
+    snapshot: Dict[str, Any],
+    *,
+    translate_formulas: bool = False,
+) -> None:
+    sheet.row_dimensions[target_row].height = snapshot["height"]
+    sheet.row_dimensions[target_row].hidden = snapshot["hidden"]
+    source_row = snapshot["source_row"]
+    for column, (value, style) in enumerate(zip(snapshot["values"], snapshot["styles"]), start=1):
+        cell = sheet.cell(target_row, column)
+        cell._style = copy(style)
+        if translate_formulas and isinstance(value, str) and value.startswith("="):
+            source_coordinate = sheet.cell(source_row, column).coordinate
+            cell.value = Translator(value, origin=source_coordinate).translate_formula(cell.coordinate)
+        else:
+            cell.value = value
+
+
+def set_total_formulas(sheet, row: int, start_row: int, end_row: int) -> None:
+    sheet.cell(row, 1).value = "Total"
+    for column in (4, 5, 6, 7, 9, 10, 11, 12, 14, 15, 16, 17):
+        letter = sheet.cell(row, column).column_letter
+        sheet.cell(row, column).value = f"=SUM({letter}{start_row}:{letter}{end_row})"
+    sheet.cell(row, 8).value = f'=IF(E{row}=0,"-",G{row}/E{row})'
+    sheet.cell(row, 13).value = f'=IF(J{row}=0,"-",L{row}/J{row})'
+    sheet.cell(row, 18).value = f'=IF(O{row}=0,"-",Q{row}/O{row})'
+
+
+def rebuild_store_performance(workbook, records: Sequence[Dict[str, object]]) -> None:
+    sheet = workbook["Store Performance"]
+    start_row = 7
+    old_total_row = next(
+        (row for row in range(start_row, sheet.max_row + 1) if sheet.cell(row, 1).value == "Total"),
+        sheet.max_row,
+    )
+    data_snapshot = snapshot_row(sheet, start_row, 18)
+    total_snapshot = snapshot_row(sheet, old_total_row, 18)
+    last_data_row = start_row + len(records) - 1
+    new_total_row = last_data_row + 2
+    clear_last = max(old_total_row, new_total_row)
+    for row in range(start_row, clear_last + 1):
+        for column in range(1, 19):
+            sheet.cell(row, column).value = None
+
+    for row, record in enumerate(records, start=start_row):
+        restore_snapshot_row(sheet, row, data_snapshot, translate_formulas=True)
+        sheet.cell(row, 1).value = record["shop_no"]
+        sheet.cell(row, 2).value = record["shop_name"]
+
+    restore_snapshot_row(sheet, new_total_row, total_snapshot)
+    set_total_formulas(sheet, new_total_row, start_row, last_data_row)
+    sheet.auto_filter.ref = f"A6:R{last_data_row}"
+
+
+def find_row_with_value(sheet, value: object, start_row: int = 1) -> int:
+    for row in range(start_row, sheet.max_row + 1):
+        if sheet.cell(row, 1).value == value:
+            return row
+    raise ValueError(f"The '{sheet.title}' sheet is missing its '{value}' row.")
+
+
+def ordered_districts(
+    sheet,
+    first_data_row: int,
+    first_total_row: int,
+    records: Sequence[Dict[str, object]],
+) -> List[str]:
+    available = {str(record["district"]).strip() for record in records}
+    result: List[str] = []
+    for row in range(first_data_row, first_total_row):
+        label = str(sheet.cell(row, 1).value or "").strip()
+        if label == "NI/ROI Mid North":
+            for district in ("Northern Ireland", "ROI Mid North"):
+                if district in available and district not in result:
+                    result.append(district)
+        elif label in available and label not in result:
+            result.append(label)
+    for record in records:
+        district = str(record["district"]).strip()
+        if district and district not in result:
+            result.append(district)
+    return result
+
+
+def set_district_total_formulas(sheet, row: int, start_row: int, end_row: int) -> None:
+    sheet.cell(row, 1).value = "Total"
+    for column in (2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 14, 15):
+        letter = sheet.cell(row, column).column_letter
+        sheet.cell(row, column).value = f"=SUM({letter}{start_row}:{letter}{end_row})"
+    sheet.cell(row, 6).value = f'=IF(C{row}=0,"-",E{row}/C{row})'
+    sheet.cell(row, 11).value = f'=IF(H{row}=0,"-",J{row}/H{row})'
+    sheet.cell(row, 16).value = f'=IF(M{row}=0,"-",O{row}/M{row})'
+
+
+def rebuild_district_performance(workbook, records: Sequence[Dict[str, object]]) -> List[str]:
+    sheet = workbook["District Performance"]
+    overall_title_row = find_row_with_value(sheet, "Overall Pass Rate")
+    first_header_row = find_row_with_value(sheet, "District", overall_title_row)
+    first_data_row = first_header_row + 1
+    first_total_row = find_row_with_value(sheet, "Total", first_data_row)
+    second_title_row = find_row_with_value(sheet, "Paddy Power Pass Rate", first_total_row + 1)
+    second_header_row = find_row_with_value(sheet, "District", second_title_row)
+    second_data_row = second_header_row + 1
+    second_total_row = find_row_with_value(sheet, "Total", second_data_row)
+
+    districts = ordered_districts(sheet, first_data_row, first_total_row, records)
+    first_data_snapshot = snapshot_row(sheet, first_data_row, 16)
+    first_total_snapshot = snapshot_row(sheet, first_total_row, 16)
+    second_title_snapshot = snapshot_row(sheet, second_title_row, 16)
+    second_period_snapshot = snapshot_row(sheet, second_title_row + 1, 16)
+    second_header_snapshot = snapshot_row(sheet, second_header_row, 16)
+    second_data_snapshot = snapshot_row(sheet, second_data_row, 16)
+    second_total_snapshot = snapshot_row(sheet, second_total_row, 16)
+
+    new_first_end = first_data_row + len(districts) - 1
+    new_first_total = new_first_end + 2
+    new_second_title = new_first_total + 3
+    new_second_header = new_second_title + 2
+    new_second_data = new_second_header + 1
+    new_second_end = new_second_data + len(districts) - 1
+    new_second_total = new_second_end + 2
+
+    for merged_range in list(sheet.merged_cells.ranges):
+        if merged_range.min_row >= second_title_row:
+            sheet.unmerge_cells(str(merged_range))
+    clear_last = max(second_total_row, new_second_total)
+    for row in range(first_data_row, clear_last + 1):
+        for column in range(1, 17):
+            sheet.cell(row, column).value = None
+
+    for row, district in enumerate(districts, start=first_data_row):
+        restore_snapshot_row(sheet, row, first_data_snapshot, translate_formulas=True)
+        sheet.cell(row, 1).value = district
+    restore_snapshot_row(sheet, new_first_total, first_total_snapshot)
+    set_district_total_formulas(sheet, new_first_total, first_data_row, new_first_end)
+
+    restore_snapshot_row(sheet, new_second_title, second_title_snapshot)
+    restore_snapshot_row(sheet, new_second_title + 1, second_period_snapshot)
+    restore_snapshot_row(sheet, new_second_header, second_header_snapshot)
+    for start_column, end_column in ((2, 6), (7, 11), (12, 16)):
+        sheet.merge_cells(
+            start_row=new_second_title + 1,
+            start_column=start_column,
+            end_row=new_second_title + 1,
+            end_column=end_column,
+        )
+    for row, district in enumerate(districts, start=new_second_data):
+        restore_snapshot_row(sheet, row, second_data_snapshot, translate_formulas=True)
+        sheet.cell(row, 1).value = district
+    restore_snapshot_row(sheet, new_second_total, second_total_snapshot)
+    set_district_total_formulas(sheet, new_second_total, new_second_data, new_second_end)
+    return districts
 
 
 def normalise_drawing_relationships(data: bytes) -> bytes:
@@ -520,6 +902,7 @@ def build_live_report(
     previous_live: bytes,
     new_rows: Sequence[Sequence[object]],
     mapping: "OrderedDict[str, Optional[str]]",
+    store_db_records: Sequence[Dict[str, object]],
     report_month: date,
     expected_country: str,
 ) -> bytes:
@@ -546,6 +929,19 @@ def build_live_report(
     ]
     r12m_rows.extend(new_rows)
 
+    store_records = merged_store_records(
+        workbook,
+        store_db_records,
+        [*ytd_rows, *r12m_rows],
+        new_rows,
+        mapping,
+    )
+    last_region_row = update_regions_sheet(workbook, store_records)
+    update_region_lookup_ranges(workbook, last_region_row)
+    make_abort_result_formulas_explicit(workbook)
+    rebuild_store_performance(workbook, store_records)
+    rebuild_district_performance(workbook, store_records)
+
     write_data_sheet(workbook["This Period"], new_rows, raw_width)
     write_data_sheet(workbook["YTD"], ytd_rows, raw_width)
     write_data_sheet(workbook["R12M"], r12m_rows, raw_width)
@@ -554,7 +950,11 @@ def build_live_report(
     workbook.calculation.calcMode = "auto"
     workbook.calculation.fullCalcOnLoad = True
     workbook.calculation.forceFullCalc = True
-    return workbook_to_bytes(workbook, drawing_source=previous_live)
+    return workbook_to_bytes(
+        workbook,
+        drawing_source=previous_live,
+        external_link_source=previous_live,
+    )
 
 
 def find_soffice() -> str:
@@ -626,7 +1026,14 @@ def build_non_live_report(formula_live: bytes, recalculated_live: bytes) -> byte
         for row in formula_sheet.iter_rows():
             for cell in row:
                 if is_formula_cell(cell):
-                    cell.value = value_sheet[cell.coordinate].value
+                    cached_value = value_sheet[cell.coordinate].value
+                    if (
+                        sheet_name == "Operational Questions"
+                        and isinstance(cached_value, str)
+                        and cached_value.startswith("#")
+                    ):
+                        cached_value = None
+                    cell.value = cached_value
 
     summary = formula_workbook["Summary Data"]
     visit_count = value_workbook["Summary Data"]["C12"].value
@@ -638,6 +1045,17 @@ def build_non_live_report(formula_live: bytes, recalculated_live: bytes) -> byte
     for sheet in list(formula_workbook._sheets):
         if sheet.title not in NON_LIVE_SHEETS:
             formula_workbook.remove(sheet)
+
+    # The retained report sheets have no external formulas, so exclude the
+    # obsolete dashboard links entirely from the client-facing workbook.
+    formula_workbook._external_links = []
+
+    summary_index = formula_workbook.sheetnames.index("Summary Data")
+    formula_workbook.active = summary_index
+    if formula_workbook.views:
+        formula_workbook.views[0].activeTab = summary_index
+    for worksheet in formula_workbook.worksheets:
+        worksheet.sheet_view.tabSelected = worksheet.title == "Summary Data"
 
     formula_workbook.calculation.calcMode = "auto"
     formula_workbook.calculation.fullCalcOnLoad = False
@@ -663,6 +1081,7 @@ def validate_required_export_columns(df: pd.DataFrame) -> None:
 @st.cache_data(show_spinner=False)
 def generate_reports(
     export_bytes: bytes,
+    store_db_bytes: bytes,
     uk_live_bytes: bytes,
     roi_live_bytes: bytes,
     uk_live_name: str,
@@ -670,6 +1089,7 @@ def generate_reports(
 ) -> Tuple[Dict[str, bytes], Dict[str, int], str]:
     df = pd.read_csv(io.BytesIO(export_bytes), dtype=str, keep_default_na=False, encoding="utf-8-sig")
     validate_required_export_columns(df)
+    store_database = load_store_database(store_db_bytes)
     original_export_count = len(df)
     df = df.drop_duplicates(subset=["internal_id"], keep="first").copy()
     duplicate_export_count = original_export_count - len(df)
@@ -717,6 +1137,7 @@ def generate_reports(
         uk_live_bytes,
         mapped_rows(uk_df, GB_MAPPING),
         GB_MAPPING,
+        store_database["UK"],
         report_month,
         "UK",
     )
@@ -724,6 +1145,7 @@ def generate_reports(
         roi_live_bytes,
         mapped_rows(roi_df, IE_MAPPING),
         IE_MAPPING,
+        store_database["ROI"],
         report_month,
         "ROI",
     )
@@ -751,21 +1173,23 @@ def run_app() -> None:
     st.set_page_config(page_title="Paddy Power Report Generator", layout="centered")
     st.title("Paddy Power Report Generator")
     st.write(
-        "Upload the new data export and the previous month's UK and ROI LIVE reports. "
+        "Upload the new data export, the Paddy Power AV Store DB, and the previous month's UK and ROI LIVE reports. "
         "The generator will create updated LIVE and non-LIVE reports for both countries."
     )
 
     export_file = st.file_uploader("Upload data export", type="csv")
+    store_db_file = st.file_uploader("Upload Paddy Power AV Store DB", type="xlsx")
     uk_live_file = st.file_uploader("Upload previous UK LIVE report", type="xlsx")
     roi_live_file = st.file_uploader("Upload previous ROI LIVE report", type="xlsx")
 
-    if not (export_file and uk_live_file and roi_live_file):
+    if not (export_file and store_db_file and uk_live_file and roi_live_file):
         return
 
     try:
         with st.spinner("Generating and recalculating reports..."):
             outputs, counts, month_label = generate_reports(
                 export_file.getvalue(),
+                store_db_file.getvalue(),
                 uk_live_file.getvalue(),
                 roi_live_file.getvalue(),
                 uk_live_file.name,
