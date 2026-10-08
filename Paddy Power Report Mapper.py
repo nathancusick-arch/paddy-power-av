@@ -1144,6 +1144,24 @@ def validate_required_export_columns(df: pd.DataFrame) -> None:
         raise ValueError(f"The data export is missing required column(s): {', '.join(missing)}.")
 
 
+def normalise_export_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """Accept plain question titles and 'Q123 - Question title' headers.
+
+    Different question IDs can share a title across surveys. Merge their
+    nonblank answers row by row to match the old export's single title column.
+    """
+    columns: Dict[str, pd.Series] = {}
+    for position, header in enumerate(df.columns):
+        title = re.sub(r"^Q\d+\s*-\s*", "", str(header))
+        answers = df.iloc[:, position]
+        if title in columns:
+            blank = columns[title].isna() | columns[title].astype(str).str.strip().eq("")
+            columns[title] = columns[title].mask(blank, answers)
+        else:
+            columns[title] = answers
+    return pd.DataFrame(columns, index=df.index)
+
+
 @st.cache_data(show_spinner=False)
 def generate_reports(
     export_bytes: bytes,
@@ -1154,6 +1172,7 @@ def generate_reports(
     roi_live_name: str,
 ) -> Tuple[Dict[str, bytes], Dict[str, int], str]:
     df = pd.read_csv(io.BytesIO(export_bytes), dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    df = normalise_export_headers(df)
     validate_required_export_columns(df)
     store_database = load_store_database(store_db_bytes)
     original_export_count = len(df)
